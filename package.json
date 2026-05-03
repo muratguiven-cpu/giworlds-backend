@@ -1,12 +1,9 @@
 {
   "name": "giworlds-backend",
   "private": true,
-  "version": "1.0.0",
-  "description": "GiWorlds game backend",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
