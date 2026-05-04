@@ -1,6 +1,6 @@
 {
   "name": "giworlds-backend",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "GiWorlds backend",
   "main": "server.js",
   "scripts": {
@@ -11,5 +11,8 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "nodemailer": "^6.9.16"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
