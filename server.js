@@ -1,171 +1,167 @@
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const fs = require('fs');
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_THIS_SECRET_IN_PRODUCTION';
-const FRONTEND_DIR = process.env.FRONTEND_DIR || path.join(__dirname, '..', 'frontend');
 const DATA_DIR = path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'users.json');
+const DB_FILE = path.join(DATA_DIR, 'db.json');
+const FRONTEND_DIR = path.join(__dirname, '..', 'frontend');
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ users: {} }, null, 2));
-
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '5mb' }));
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(FRONTEND_DIR));
 
-function readDb() {
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-  catch { return { users: {} }; }
+function ensureDb() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ users: {}, sessions: {}, otp: {} }, null, 2));
 }
-
+function readDb() {
+  ensureDb();
+  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+  catch { return { users: {}, sessions: {}, otp: {} }; }
+}
 function writeDb(db) {
+  ensureDb();
   fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
-
-function cleanEmail(value) {
-  return String(value || '').trim().toLowerCase();
+function normalizeEmail(email) { return String(email || '').trim().toLowerCase(); }
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const hash = crypto.pbkdf2Sync(String(password), salt, 120000, 64, 'sha512').toString('hex');
+  return { salt, hash };
 }
-
-function cleanNick(value) {
-  return String(value || '').trim().replace(/[<>]/g, '').slice(0, 24);
+function verifyPassword(password, record) {
+  if (!record || !record.salt || !record.hash) return false;
+  return hashPassword(password, record.salt).hash === record.hash;
 }
+function makeToken() { return crypto.randomBytes(32).toString('hex'); }
 
-function publicUser(user) {
-  return {
-    username: user.username,
-    email: user.username,
-    nick: user.nick,
-    gameState: user.gameState || {}
-  };
+function requireSmtpConfig() {
+  const required = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'MAIL_FROM'];
+  const missing = required.filter((key) => !process.env[key]);
+  if (missing.length) {
+    throw new Error('SMTP ayarları eksik: ' + missing.join(', '));
+  }
 }
-
-app.get('/api/health', (req, res) => {
-  res.json({ success: true, app: 'GiWorlds' });
-});
-
-app.post('/api/register', async (req, res) => {
-  const username = cleanEmail(req.body.username || req.body.email);
-  const password = String(req.body.password || '');
-  const nick = cleanNick(req.body.nick || req.body.nickname);
-
-  if (!username.includes('@')) return res.status(400).json({ success: false, message: 'Geçerli mail adresi gerekli.' });
-  if (password.length < 6) return res.status(400).json({ success: false, message: 'Şifre en az 6 karakter olmalı.' });
-  if (nick.length < 2) return res.status(400).json({ success: false, message: 'Nickname en az 2 karakter olmalı.' });
-
-  const db = readDb();
-  if (db.users[username]) return res.status(409).json({ success: false, message: 'Bu mail adresi zaten kayıtlı.' });
-
-  const duplicateNick = Object.values(db.users).some(u => String(u.nick || '').toLowerCase() === nick.toLowerCase());
-  if (duplicateNick) return res.status(409).json({ success: false, message: 'Bu nickname kullanılıyor.' });
-
-  const passwordHash = await bcrypt.hash(password, 12);
-  const now = Date.now();
-  db.users[username] = {
-    username,
-    nick,
-    passwordHash,
-    createdAt: now,
-    updatedAt: now,
-    gameState: {
-      cash: 1000,
-      bank: 0,
-      gold: 0,
-      price: 6749,
-      income: 0,
-      expense: 0,
-      taxPaid: 0,
-      workCount: 0,
-      player: nick,
-      companies: [],
-      lastSavedAt: now
-    }
-  };
-  writeDb(db);
-
-  const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ success: true, token, user: publicUser(db.users[username]) });
-});
-
-app.post('/api/login', async (req, res) => {
-  const username = cleanEmail(req.body.username || req.body.email);
-  const password = String(req.body.password || '');
-  const db = readDb();
-  const user = db.users[username];
-
-  if (!user) return res.status(401).json({ success: false, message: 'Mail veya şifre hatalı.' });
-  const ok = await bcrypt.compare(password, user.passwordHash);
-  if (!ok) return res.status(401).json({ success: false, message: 'Mail veya şifre hatalı.' });
-
-  const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ success: true, token, user: publicUser(user) });
-});
-
-app.post('/api/save', (req, res) => {
-  const username = cleanEmail(req.body.username || req.body.email);
-  const gameState = req.body.gameState || {};
-  const db = readDb();
-  const user = db.users[username];
-
-  if (!user) return res.status(404).json({ success: false, message: 'Kullanıcı bulunamadı.' });
-
-  const lockedNick = user.nick;
-  user.gameState = {
-    ...gameState,
-    player: lockedNick,
-    lastSavedAt: Date.now()
-  };
-  user.updatedAt = Date.now();
-  writeDb(db);
-  res.json({ success: true });
-});
-
-app.get('/api/leaderboard', (req, res) => {
-  const db = readDb();
-  const players = Object.values(db.users).map(user => {
-    const g = user.gameState || {};
-    const cash = Number(g.cash || 0);
-    const bank = Number(g.bank || 0);
-    const gold = Number(g.gold || 0);
-    const price = Number(g.price || 6749);
-    const wealth = Number(g.wealth || (cash + bank + gold * price));
-    return {
-      nick: user.nick,
-      wealth,
-      tax: Number(g.taxPaid || 0),
-      work: Number(g.workCount || 0)
-    };
-  }).filter(p => p.nick && p.nick !== 'Oyuncu');
-
-  const sortBy = key => [...players].sort((a, b) => Number(b[key] || 0) - Number(a[key] || 0)).slice(0, 100);
-  res.json({
-    success: true,
-    leaderboard: {
-      wealth: sortBy('wealth'),
-      tax: sortBy('tax'),
-      work: sortBy('work')
+function getMailer() {
+  requireSmtpConfig();
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || Number(process.env.SMTP_PORT) === 465,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    },
+    tls: {
+      rejectUnauthorized: String(process.env.SMTP_REJECT_UNAUTHORIZED || 'true').toLowerCase() !== 'false'
     }
   });
-});
-
-app.post('/api/forgot-password', (req, res) => {
-  res.status(501).json({
-    success: false,
-    message: 'Mail ile şifre sıfırlama için SMTP servisi bağlanmalıdır. Eski şifre mail ile gönderilmez.'
+}
+async function sendOtpMail(to, otp) {
+  const transporter = getMailer();
+  const appName = process.env.MAIL_APP_NAME || 'GiWorlds';
+  await transporter.sendMail({
+    from: process.env.MAIL_FROM,
+    to,
+    subject: appName + ' şifre yenileme kodu',
+    text: `Merhaba,\n\n${appName} şifre yenileme kodunuz: ${otp}\n\nBu kod 5 dakika geçerlidir. Bu işlemi siz yapmadıysanız bu maili dikkate almayın.`,
+    html: `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#111827"><h2>${appName} Şifre Yenileme</h2><p>Tek kullanımlık şifre yenileme kodunuz:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${otp}</p><p>Bu kod <b>5 dakika</b> geçerlidir.</p><p>Bu işlemi siz yapmadıysanız bu maili dikkate almayın.</p></div>`
   });
+}
+
+function auth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const db = readDb();
+  const email = db.sessions[token];
+  if (!token || !email || !db.users[email]) return res.status(401).json({ ok: false, error: 'Oturum bulunamadı. Tekrar giriş yap.' });
+  req.db = db; req.email = email; req.user = db.users[email]; req.token = token;
+  next();
+}
+function cleanSave(save, nick) {
+  const safe = save && typeof save === 'object' ? save : {};
+  safe.player = nick || safe.player || '';
+  safe.updatedAt = Date.now();
+  return safe;
+}
+
+app.get('/api/health', (req, res) => res.json({ ok: true, name: 'GiWorlds Backend' }));
+
+app.post('/api/register', (req, res) => {
+  const { nick, password, save } = req.body || {};
+  const email = normalizeEmail(req.body && req.body.email);
+  if (!nick || String(nick).trim().length < 2) return res.status(400).json({ ok: false, error: 'Nickname en az 2 karakter olmalı.' });
+  if (!email.includes('@')) return res.status(400).json({ ok: false, error: 'Geçerli mail adresi yaz.' });
+  if (!password || String(password).length < 6) return res.status(400).json({ ok: false, error: 'Şifre en az 6 karakter olmalı.' });
+  const db = readDb();
+  if (db.users[email]) return res.status(409).json({ ok: false, error: 'Bu mail adresiyle zaten kayıt var.' });
+  const pass = hashPassword(password);
+  db.users[email] = { email, nick: String(nick).trim(), pass, save: cleanSave(save, String(nick).trim()), createdAt: Date.now() };
+  const token = makeToken(); db.sessions[token] = email;
+  writeDb(db);
+  res.json({ ok: true, token, user: { email, nick: db.users[email].nick }, save: db.users[email].save });
 });
 
-app.get('*', (req, res) => {
-  res.sendFile(path.join(FRONTEND_DIR, 'index.html'));
+app.post('/api/login', (req, res) => {
+  const email = normalizeEmail(req.body && req.body.email);
+  const password = req.body && req.body.password;
+  const db = readDb();
+  const user = db.users[email];
+  if (!user || !verifyPassword(password, user.pass)) return res.status(401).json({ ok: false, error: 'Mail adresi veya şifre hatalı.' });
+  const token = makeToken(); db.sessions[token] = email;
+  writeDb(db);
+  res.json({ ok: true, token, user: { email, nick: user.nick }, save: user.save || null });
 });
+
+app.post('/api/save', auth, (req, res) => {
+  req.user.save = cleanSave(req.body && req.body.save, req.user.nick);
+  req.db.users[req.email] = req.user;
+  writeDb(req.db);
+  res.json({ ok: true, savedAt: req.user.save.updatedAt });
+});
+
+app.post('/api/load', auth, (req, res) => {
+  res.json({ ok: true, user: { email: req.email, nick: req.user.nick }, save: req.user.save || null });
+});
+
+app.post('/api/forgot/request', async (req, res) => {
+  const email = normalizeEmail(req.body && req.body.email);
+  const db = readDb();
+  if (!db.users[email]) return res.status(404).json({ ok: false, error: 'Bu mail adresiyle kayıt bulunamadı.' });
+  const otp = String(Math.floor(100000 + Math.random() * 900000));
+  try {
+    await sendOtpMail(email, otp);
+    db.otp[email] = { otp, expires: Date.now() + 5 * 60 * 1000, sentAt: Date.now() };
+    writeDb(db);
+    res.json({ ok: true, message: 'Tek kullanımlık kod mail adresine gönderildi.' });
+  } catch (err) {
+    console.error('GiWorlds OTP mail gönderilemedi:', err.message);
+    res.status(500).json({ ok: false, error: 'Mail gönderilemedi. SMTP ayarlarını kontrol et.' });
+  }
+});
+
+app.post('/api/forgot/reset', (req, res) => {
+  const email = normalizeEmail(req.body && req.body.email);
+  const { otp, newPassword } = req.body || {};
+  const db = readDb();
+  const row = db.otp[email];
+  if (!db.users[email]) return res.status(404).json({ ok: false, error: 'Hesap bulunamadı.' });
+  if (!row || Date.now() > row.expires || row.otp !== String(otp || '')) return res.status(400).json({ ok: false, error: 'Tek kullanımlık şifre hatalı veya süresi dolmuş.' });
+  if (!newPassword || String(newPassword).length < 6) return res.status(400).json({ ok: false, error: 'Yeni şifre en az 6 karakter olmalı.' });
+  db.users[email].pass = hashPassword(newPassword);
+  delete db.otp[email];
+  writeDb(db);
+  res.json({ ok: true });
+});
+
+app.get('*', (req, res) => res.sendFile(path.join(FRONTEND_DIR, 'index.html')));
 
 app.listen(PORT, () => {
-  console.log(`GiWorlds backend çalışıyor: http://localhost:${PORT}`);
+  ensureDb();
+  console.log(`GiWorlds Backend çalışıyor: http://localhost:${PORT}`);
 });
