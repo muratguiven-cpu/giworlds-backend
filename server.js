@@ -62,17 +62,25 @@ function requireSmtpConfig() {
 }
 function getMailer() {
   requireSmtpConfig();
+
+  const smtpPort = Number(process.env.SMTP_PORT || 587);
+  const smtpSecure = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true';
+
   return nodemailer.createTransport({
     host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || Number(process.env.SMTP_PORT) === 465,
+    port: smtpPort,
+    secure: smtpSecure,
     auth: {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS
     },
-    connectionTimeout: 20000,
-    greetingTimeout: 20000,
-    socketTimeout: 30000,
+
+    // Render Free ilk istekte yavaş uyanabildiği için süreleri yüksek tutuyoruz.
+    connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT || 60000),
+    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT || 60000),
+    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT || 60000),
+
+    // Gmail/Natro gibi servislerde TLS uyumu için.
     tls: {
       rejectUnauthorized: String(process.env.SMTP_REJECT_UNAUTHORIZED || 'true').toLowerCase() !== 'false'
     }
@@ -110,7 +118,10 @@ app.get('/', (req, res) => res.json({ ok: true, name: 'GiWorlds Backend', messag
 app.get('/api/health', (req, res) => res.json({
   ok: true,
   name: 'GiWorlds Backend',
-  smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.MAIL_FROM)
+  smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.MAIL_FROM),
+  smtpHost: process.env.SMTP_HOST || null,
+  smtpPort: process.env.SMTP_PORT || null,
+  smtpSecure: process.env.SMTP_SECURE || null
 }));
 
 app.post('/api/register', (req, res) => {
@@ -161,7 +172,9 @@ app.post('/api/forgot/request', async (req, res) => {
     writeDb(db);
     res.json({ ok: true, message: 'Tek kullanımlık kod mail adresine gönderildi.' });
   } catch (err) {
-    console.error('GiWorlds OTP mail gönderilemedi:', err.message);
+    console.error('GiWorlds OTP mail gönderilemedi:', err && err.message ? err.message : err);
+    if (err && err.code) console.error('SMTP hata kodu:', err.code);
+    if (err && err.command) console.error('SMTP komutu:', err.command);
     res.status(500).json({ ok: false, error: 'Mail gönderilemedi. SMTP ayarlarını kontrol et.' });
   }
 });
