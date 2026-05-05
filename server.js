@@ -3,6 +3,7 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -28,7 +29,9 @@ app.use(express.json({ limit: '10mb' }));
 
 function ensureDb() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ users: {}, sessions: {}, otp: {} }, null, 2));
+  if (!fs.existsSync(DB_FILE)) {
+    fs.writeFileSync(DB_FILE, JSON.stringify({ users: {}, sessions: {}, otp: {} }, null, 2));
+  }
 }
 function readDb() {
   ensureDb();
@@ -49,57 +52,6 @@ function verifyPassword(password, record) {
   return hashPassword(password, record.salt).hash === record.hash;
 }
 function makeToken() { return crypto.randomBytes(32).toString('hex'); }
-
-function requireBrevoConfig() {
-  const required = ['BREVO_API_KEY', 'MAIL_FROM'];
-  const missing = required.filter((key) => !process.env[key]);
-  if (missing.length) {
-    throw new Error('Brevo API ayarları eksik: ' + missing.join(', '));
-  }
-}
-
-async function sendOtpMail(to, otp) {
-  requireBrevoConfig();
-
-  const appName = process.env.MAIL_APP_NAME || 'GiWorlds';
-  const senderName = process.env.MAIL_FROM_NAME || 'GiWorlds';
-  const fromEmail = process.env.MAIL_FROM;
-
-  const payload = {
-    sender: { name: senderName, email: fromEmail },
-    to: [{ email: to }],
-    subject: appName + ' şifre yenileme kodu',
-    textContent: `Merhaba,\n\n${appName} şifre yenileme kodunuz: ${otp}\n\nBu kod 5 dakika geçerlidir. Bu işlemi siz yapmadıysanız bu maili dikkate almayın.`,
-    htmlContent: `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#111827"><h2>${appName} Şifre Yenileme</h2><p>Tek kullanımlık şifre yenileme kodunuz:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${otp}</p><p>Bu kod <b>5 dakika</b> geçerlidir.</p><p>Bu işlemi siz yapmadıysanız bu maili dikkate almayın.</p></div>`
-  };
-
-  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
-    headers: {
-      'api-key': process.env.BREVO_API_KEY,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
-
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`Brevo API hata ${response.status}: ${text}`);
-  }
-
-  console.log('GiWorlds OTP Brevo API ile gönderildi:', to);
-}
-
-function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  const db = readDb();
-  const email = db.sessions[token];
-  if (!token || !email || !db.users[email]) return res.status(401).json({ ok: false, error: 'Oturum bulunamadı. Tekrar giriş yap.' });
-  req.db = db; req.email = email; req.user = db.users[email]; req.token = token;
-  next();
-}
 function cleanSave(save, nick) {
   const safe = save && typeof save === 'object' ? save : {};
   safe.player = nick || safe.player || '';
@@ -107,16 +59,62 @@ function cleanSave(save, nick) {
   return safe;
 }
 
-app.get('/', (req, res) => res.json({
-  ok: true,
-  name: 'GiWorlds Backend',
-  message: 'Backend çalışıyor. Oyun arayüzü Natro üzerindedir.'
-}));
+function requireBrevoConfig() {
+  const required = ['BREVO_API_KEY', 'MAIL_FROM'];
+  const missing = required.filter((key) => !process.env[key]);
+  if (missing.length) throw new Error('Brevo API ayarları eksik: ' + missing.join(', '));
+  if (!String(process.env.BREVO_API_KEY).startsWith('xkeysib-')) {
+    throw new Error('BREVO_API_KEY yanlış tipte. API key xkeysib- ile başlamalı.');
+  }
+}
+
+async function sendOtpMail(to, otp) {
+  requireBrevoConfig();
+  const appName = process.env.MAIL_APP_NAME || 'GiWorlds';
+  const senderName = process.env.MAIL_FROM_NAME || appName;
+  const senderEmail = process.env.MAIL_FROM;
+
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'accept': 'application/json',
+      'content-type': 'application/json',
+      'api-key': process.env.BREVO_API_KEY
+    },
+    body: JSON.stringify({
+      sender: { name: senderName, email: senderEmail },
+      to: [{ email: to }],
+      subject: appName + ' tek kullanımlık giriş kodu',
+      textContent: `Merhaba,\n\n${appName} tek kullanımlık giriş kodunuz: ${otp}\n\nBu kod 5 dakika geçerlidir. Bu işlemi siz yapmadıysanız bu maili dikkate almayın.`,
+      htmlContent: `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#111827"><h2>${appName} Tek Kullanımlık Giriş</h2><p>Giriş kodunuz:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${otp}</p><p>Bu kod <b>5 dakika</b> geçerlidir.</p><p>Bu işlemi siz yapmadıysanız bu maili dikkate almayın.</p></div>`
+    })
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Brevo API hata ${response.status}: ${text}`);
+  }
+  return text;
+}
+
+function auth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const db = readDb();
+  const email = db.sessions[token];
+  if (!token || !email || !db.users[email]) {
+    return res.status(401).json({ ok: false, error: 'Oturum bulunamadı. Tekrar giriş yap.' });
+  }
+  req.db = db; req.email = email; req.user = db.users[email]; req.token = token;
+  next();
+}
+
+app.get('/', (req, res) => res.json({ ok: true, name: 'GiWorlds Backend', message: 'Backend çalışıyor.' }));
 app.get('/api/health', (req, res) => res.json({
   ok: true,
   name: 'GiWorlds Backend',
-  mailMode: 'brevo_api',
-  brevoConfigured: Boolean(process.env.BREVO_API_KEY && process.env.MAIL_FROM)
+  brevoConfigured: Boolean(process.env.BREVO_API_KEY && process.env.MAIL_FROM),
+  otpLogin: true
 }));
 
 app.post('/api/register', (req, res) => {
@@ -156,6 +154,7 @@ app.post('/api/load', auth, (req, res) => {
   res.json({ ok: true, user: { email: req.email, nick: req.user.nick }, save: req.user.save || null });
 });
 
+// 1) OTP kodu gönderir
 app.post('/api/forgot/request', async (req, res) => {
   const email = normalizeEmail(req.body && req.body.email);
   const db = readDb();
@@ -163,27 +162,70 @@ app.post('/api/forgot/request', async (req, res) => {
   const otp = String(Math.floor(100000 + Math.random() * 900000));
   try {
     await sendOtpMail(email, otp);
-    db.otp[email] = { otp, expires: Date.now() + 5 * 60 * 1000, sentAt: Date.now() };
+    db.otp[email] = { otp, expires: Date.now() + 5 * 60 * 1000, sentAt: Date.now(), used: false };
     writeDb(db);
-    res.json({ ok: true, message: 'Tek kullanımlık kod mail adresine gönderildi.' });
+    res.json({ ok: true, message: 'Tek kullanımlık giriş kodu mail adresine gönderildi. Kod 5 dakika geçerlidir.' });
   } catch (err) {
     console.error('GiWorlds OTP mail gönderilemedi:', err.message);
     res.status(500).json({ ok: false, error: 'Mail gönderilemedi. Brevo API ayarlarını kontrol et.' });
   }
 });
 
+function verifyOtpAndLogin(email, otp) {
+  const db = readDb();
+  const user = db.users[email];
+  const row = db.otp[email];
+  if (!user) return { status: 404, body: { ok: false, error: 'Hesap bulunamadı.' } };
+  if (!row || row.used || Date.now() > row.expires || row.otp !== String(otp || '').trim()) {
+    return { status: 400, body: { ok: false, error: 'Tek kullanımlık kod hatalı veya süresi dolmuş.' } };
+  }
+  row.used = true;
+  const token = makeToken();
+  db.sessions[token] = email;
+  delete db.otp[email];
+  writeDb(db);
+  return { status: 200, body: { ok: true, token, user: { email, nick: user.nick }, save: user.save || null } };
+}
+
+// 2) OTP kodunu doğrular ve kullanıcıyı oyuna giriş yaptırır
+app.post('/api/otp/login', (req, res) => {
+  const email = normalizeEmail(req.body && req.body.email);
+  const otp = req.body && (req.body.otp || req.body.code);
+  const result = verifyOtpAndLogin(email, otp);
+  res.status(result.status).json(result.body);
+});
+
+// Frontend eski endpoint kullanırsa da OTP ile giriş yapsın.
+app.post('/api/forgot/verify', (req, res) => {
+  const email = normalizeEmail(req.body && req.body.email);
+  const otp = req.body && (req.body.otp || req.body.code);
+  const result = verifyOtpAndLogin(email, otp);
+  res.status(result.status).json(result.body);
+});
+
+// Eski şifre yenileme sistemi de kalsın: yeni şifre verilirse şifre değiştirir.
 app.post('/api/forgot/reset', (req, res) => {
   const email = normalizeEmail(req.body && req.body.email);
-  const { otp, newPassword } = req.body || {};
+  const { otp, code, newPassword } = req.body || {};
+  const finalOtp = otp || code;
   const db = readDb();
   const row = db.otp[email];
   if (!db.users[email]) return res.status(404).json({ ok: false, error: 'Hesap bulunamadı.' });
-  if (!row || Date.now() > row.expires || row.otp !== String(otp || '')) return res.status(400).json({ ok: false, error: 'Tek kullanımlık şifre hatalı veya süresi dolmuş.' });
-  if (!newPassword || String(newPassword).length < 6) return res.status(400).json({ ok: false, error: 'Yeni şifre en az 6 karakter olmalı.' });
+  if (!row || row.used || Date.now() > row.expires || row.otp !== String(finalOtp || '').trim()) {
+    return res.status(400).json({ ok: false, error: 'Tek kullanımlık kod hatalı veya süresi dolmuş.' });
+  }
+  if (!newPassword || String(newPassword).length < 6) {
+    // Yeni şifre yoksa OTP ile direkt giriş yaptır.
+    const result = verifyOtpAndLogin(email, finalOtp);
+    return res.status(result.status).json(result.body);
+  }
   db.users[email].pass = hashPassword(newPassword);
+  row.used = true;
   delete db.otp[email];
+  const token = makeToken();
+  db.sessions[token] = email;
   writeDb(db);
-  res.json({ ok: true });
+  res.json({ ok: true, token, user: { email, nick: db.users[email].nick }, save: db.users[email].save || null });
 });
 
 app.listen(PORT, () => {
