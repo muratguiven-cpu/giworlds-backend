@@ -12,9 +12,9 @@ const transporter = nodemailer.createTransport({
   port: 587,
   secure: false,
   auth: {
-    user: "muratguiven@gmail.com",
-    pass: "emfaxvolqcztreqs", // gmail app password
-  },
+  user: process.env.MAIL_USER,
+  pass: process.env.MAIL_PASS,
+}
 });
 
 // TEST endpoint
