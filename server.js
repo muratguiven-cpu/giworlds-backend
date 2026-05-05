@@ -60,6 +60,7 @@ function requireMailConfig() {
     throw new Error('Gmail ayarları eksik: ' + missing.join(', '));
   }
 }
+
 function getMailer() {
   requireMailConfig();
   return nodemailer.createTransport({
@@ -68,11 +69,12 @@ function getMailer() {
       user: process.env.MAIL_USER,
       pass: process.env.MAIL_PASS
     },
-    connectionTimeout: 20000,
-    greetingTimeout: 20000,
-    socketTimeout: 30000
+    connectionTimeout: 30000,
+    greetingTimeout: 30000,
+    socketTimeout: 60000
   });
 }
+
 async function sendOtpMail(to, otp) {
   const transporter = getMailer();
   const appName = process.env.MAIL_APP_NAME || 'GiWorlds';
@@ -105,7 +107,7 @@ app.get('/', (req, res) => res.json({ ok: true, name: 'GiWorlds Backend', messag
 app.get('/api/health', (req, res) => res.json({
   ok: true,
   name: 'GiWorlds Backend',
-  mailConfigured: Boolean(process.env.MAIL_USER && process.env.MAIL_PASS)
+  gmailConfigured: Boolean(process.env.MAIL_USER && process.env.MAIL_PASS)
 }));
 
 app.post('/api/register', (req, res) => {
@@ -156,8 +158,8 @@ app.post('/api/forgot/request', async (req, res) => {
     writeDb(db);
     res.json({ ok: true, message: 'Tek kullanımlık kod mail adresine gönderildi.' });
   } catch (err) {
-    console.error('GiWorlds OTP mail gönderilemedi:', err && (err.stack || err.message || err));
-    res.status(500).json({ ok: false, error: 'Mail gönderilemedi. Gmail App Password / MAIL_USER / MAIL_PASS ayarlarını kontrol et.' });
+    console.error('GiWorlds OTP Gmail gönderilemedi:', err.message);
+    res.status(500).json({ ok: false, error: 'Mail gönderilemedi. Gmail App Password / Render ayarlarını kontrol et.' });
   }
 });
 
