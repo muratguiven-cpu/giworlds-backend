@@ -53,48 +53,87 @@ function verifyPassword(password, record) {
 }
 function makeToken() { return crypto.randomBytes(32).toString('hex'); }
 
-function requireSmtpConfig() {
+function requireMailConfig() {
+  // Öncelik: Brevo HTTP API. Render üzerinde SMTP port timeout yaşandığı için daha güvenilir.
+  if (process.env.BREVO_API_KEY) {
+    if (!process.env.MAIL_FROM) throw new Error('MAIL_FROM eksik');
+    return { mode: 'brevo-api' };
+  }
+
+  // Yedek yöntem: SMTP
   const required = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'MAIL_FROM'];
   const missing = required.filter((key) => !process.env[key]);
   if (missing.length) {
     throw new Error('SMTP ayarları eksik: ' + missing.join(', '));
   }
+  return { mode: 'smtp' };
 }
+
 function getMailer() {
-  requireSmtpConfig();
-
-  const smtpPort = Number(process.env.SMTP_PORT || 587);
-  const smtpSecure = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true';
-
+  requireMailConfig();
   return nodemailer.createTransport({
     host: process.env.SMTP_HOST,
-    port: smtpPort,
-    secure: smtpSecure,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
     auth: {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS
     },
-
-    // Render Free ilk istekte yavaş uyanabildiği için süreleri yüksek tutuyoruz.
+    pool: false,
     connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT || 60000),
     greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT || 60000),
     socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT || 60000),
-
-    // Gmail/Natro gibi servislerde TLS uyumu için.
     tls: {
       rejectUnauthorized: String(process.env.SMTP_REJECT_UNAUTHORIZED || 'true').toLowerCase() !== 'false'
     }
   });
 }
+
 async function sendOtpMail(to, otp) {
-  const transporter = getMailer();
+  const cfg = requireMailConfig();
   const appName = process.env.MAIL_APP_NAME || 'GiWorlds';
+  const subject = appName + ' şifre yenileme kodu';
+  const text = `Merhaba,
+
+${appName} şifre yenileme kodunuz: ${otp}
+
+Bu kod 5 dakika geçerlidir. Bu işlemi siz yapmadıysanız bu maili dikkate almayın.`;
+  const html = `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#111827"><h2>${appName} Şifre Yenileme</h2><p>Tek kullanımlık şifre yenileme kodunuz:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${otp}</p><p>Bu kod <b>5 dakika</b> geçerlidir.</p><p>Bu işlemi siz yapmadıysanız bu maili dikkate almayın.</p></div>`;
+
+  if (cfg.mode === 'brevo-api') {
+    const fromEmail = process.env.MAIL_FROM;
+    const fromName = process.env.MAIL_FROM_NAME || appName;
+
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'api-key': process.env.BREVO_API_KEY,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        sender: { name: fromName, email: fromEmail },
+        to: [{ email: to }],
+        subject,
+        textContent: text,
+        htmlContent: html
+      })
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`Brevo API hatası: HTTP ${response.status} ${detail}`.slice(0, 700));
+    }
+    return;
+  }
+
+  const transporter = getMailer();
   await transporter.sendMail({
     from: process.env.MAIL_FROM,
     to,
-    subject: appName + ' şifre yenileme kodu',
-    text: `Merhaba,\n\n${appName} şifre yenileme kodunuz: ${otp}\n\nBu kod 5 dakika geçerlidir. Bu işlemi siz yapmadıysanız bu maili dikkate almayın.`,
-    html: `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#111827"><h2>${appName} Şifre Yenileme</h2><p>Tek kullanımlık şifre yenileme kodunuz:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${otp}</p><p>Bu kod <b>5 dakika</b> geçerlidir.</p><p>Bu işlemi siz yapmadıysanız bu maili dikkate almayın.</p></div>`
+    subject,
+    text,
+    html
   });
 }
 
@@ -118,10 +157,8 @@ app.get('/', (req, res) => res.json({ ok: true, name: 'GiWorlds Backend', messag
 app.get('/api/health', (req, res) => res.json({
   ok: true,
   name: 'GiWorlds Backend',
-  smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.MAIL_FROM),
-  smtpHost: process.env.SMTP_HOST || null,
-  smtpPort: process.env.SMTP_PORT || null,
-  smtpSecure: process.env.SMTP_SECURE || null
+  mailConfigured: Boolean((process.env.BREVO_API_KEY && process.env.MAIL_FROM) || (process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.MAIL_FROM)),
+  mailMode: process.env.BREVO_API_KEY ? 'brevo-api' : 'smtp'
 }));
 
 app.post('/api/register', (req, res) => {
@@ -172,9 +209,7 @@ app.post('/api/forgot/request', async (req, res) => {
     writeDb(db);
     res.json({ ok: true, message: 'Tek kullanımlık kod mail adresine gönderildi.' });
   } catch (err) {
-    console.error('GiWorlds OTP mail gönderilemedi:', err && err.message ? err.message : err);
-    if (err && err.code) console.error('SMTP hata kodu:', err.code);
-    if (err && err.command) console.error('SMTP komutu:', err.command);
+    console.error('GiWorlds OTP mail gönderilemedi:', err.message);
     res.status(500).json({ ok: false, error: 'Mail gönderilemedi. SMTP ayarlarını kontrol et.' });
   }
 });
