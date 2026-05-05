@@ -3,8 +3,6 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
-require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,7 +11,6 @@ const DB_FILE = path.join(DATA_DIR, 'db.json');
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Tarayıcı dışı istekler ve izinli site adresleri
     const allowed = [
       'https://giworlds.com',
       'https://www.giworlds.com',
@@ -23,7 +20,7 @@ app.use(cors({
       'http://localhost:3000'
     ];
     if (!origin || allowed.includes(origin)) return callback(null, true);
-    return callback(null, true); // geçici geniş izin: canlı testte CORS engelini kaldırır
+    return callback(null, true);
   },
   credentials: false
 }));
@@ -53,38 +50,45 @@ function verifyPassword(password, record) {
 }
 function makeToken() { return crypto.randomBytes(32).toString('hex'); }
 
-function requireMailConfig() {
-  const required = ['MAIL_USER', 'MAIL_PASS'];
+function requireBrevoConfig() {
+  const required = ['BREVO_API_KEY', 'MAIL_FROM'];
   const missing = required.filter((key) => !process.env[key]);
   if (missing.length) {
-    throw new Error('Gmail ayarları eksik: ' + missing.join(', '));
+    throw new Error('Brevo API ayarları eksik: ' + missing.join(', '));
   }
 }
 
-function getMailer() {
-  requireMailConfig();
-  return nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: process.env.MAIL_USER,
-      pass: process.env.MAIL_PASS
-    },
-    connectionTimeout: 30000,
-    greetingTimeout: 30000,
-    socketTimeout: 60000
-  });
-}
-
 async function sendOtpMail(to, otp) {
-  const transporter = getMailer();
+  requireBrevoConfig();
+
   const appName = process.env.MAIL_APP_NAME || 'GiWorlds';
-  await transporter.sendMail({
-    from: `"${process.env.MAIL_FROM_NAME || appName}" <${process.env.MAIL_USER}>`,
-    to,
+  const senderName = process.env.MAIL_FROM_NAME || 'GiWorlds';
+  const fromEmail = process.env.MAIL_FROM;
+
+  const payload = {
+    sender: { name: senderName, email: fromEmail },
+    to: [{ email: to }],
     subject: appName + ' şifre yenileme kodu',
-    text: `Merhaba,\n\n${appName} şifre yenileme kodunuz: ${otp}\n\nBu kod 5 dakika geçerlidir. Bu işlemi siz yapmadıysanız bu maili dikkate almayın.`,
-    html: `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#111827"><h2>${appName} Şifre Yenileme</h2><p>Tek kullanımlık şifre yenileme kodunuz:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${otp}</p><p>Bu kod <b>5 dakika</b> geçerlidir.</p><p>Bu işlemi siz yapmadıysanız bu maili dikkate almayın.</p></div>`
+    textContent: `Merhaba,\n\n${appName} şifre yenileme kodunuz: ${otp}\n\nBu kod 5 dakika geçerlidir. Bu işlemi siz yapmadıysanız bu maili dikkate almayın.`,
+    htmlContent: `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#111827"><h2>${appName} Şifre Yenileme</h2><p>Tek kullanımlık şifre yenileme kodunuz:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${otp}</p><p>Bu kod <b>5 dakika</b> geçerlidir.</p><p>Bu işlemi siz yapmadıysanız bu maili dikkate almayın.</p></div>`
+  };
+
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': process.env.BREVO_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify(payload)
   });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Brevo API hata ${response.status}: ${text}`);
+  }
+
+  console.log('GiWorlds OTP Brevo API ile gönderildi:', to);
 }
 
 function auth(req, res, next) {
@@ -103,11 +107,16 @@ function cleanSave(save, nick) {
   return safe;
 }
 
-app.get('/', (req, res) => res.json({ ok: true, name: 'GiWorlds Backend', message: 'Backend çalışıyor. Oyun arayüzü Natro üzerindedir.' }));
+app.get('/', (req, res) => res.json({
+  ok: true,
+  name: 'GiWorlds Backend',
+  message: 'Backend çalışıyor. Oyun arayüzü Natro üzerindedir.'
+}));
 app.get('/api/health', (req, res) => res.json({
   ok: true,
   name: 'GiWorlds Backend',
-  gmailConfigured: Boolean(process.env.MAIL_USER && process.env.MAIL_PASS)
+  mailMode: 'brevo_api',
+  brevoConfigured: Boolean(process.env.BREVO_API_KEY && process.env.MAIL_FROM)
 }));
 
 app.post('/api/register', (req, res) => {
@@ -158,8 +167,8 @@ app.post('/api/forgot/request', async (req, res) => {
     writeDb(db);
     res.json({ ok: true, message: 'Tek kullanımlık kod mail adresine gönderildi.' });
   } catch (err) {
-    console.error('GiWorlds OTP Gmail gönderilemedi:', err.message);
-    res.status(500).json({ ok: false, error: 'Mail gönderilemedi. Gmail App Password / Render ayarlarını kontrol et.' });
+    console.error('GiWorlds OTP mail gönderilemedi:', err.message);
+    res.status(500).json({ ok: false, error: 'Mail gönderilemedi. Brevo API ayarlarını kontrol et.' });
   }
 });
 
