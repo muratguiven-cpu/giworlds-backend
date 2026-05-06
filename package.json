@@ -1,16 +1,15 @@
 {
   "name": "giworlds-backend",
-  "version": "1.0.28",
+  "version": "1.0.29",
+  "description": "GiWorlds backend with MongoDB persistent saves and Brevo API mail",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "express": "^4.18.3",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2"
-  },
-  "engines": {
-    "node": ">=18"
+    "dotenv": "^16.4.5",
+    "mongodb": "^6.8.0"
   }
 }
