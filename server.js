@@ -1,14 +1,15 @@
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
+const { MongoClient } = require('mongodb');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'db.json');
+const MONGODB_URI = process.env.MONGODB_URI;
+const DB_NAME = process.env.MONGODB_DB || 'giworlds';
+
+let db;
 
 app.use(cors({
   origin: function(origin, callback) {
@@ -27,21 +28,20 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
-function ensureDb() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify({ users: {}, sessions: {}, otp: {} }, null, 2));
-  }
+async function connectDb() {
+  if (db) return db;
+  if (!MONGODB_URI) throw new Error('MONGODB_URI eksik. Render Environment içine MongoDB bağlantı linkini ekle.');
+  const client = new MongoClient(MONGODB_URI);
+  await client.connect();
+  db = client.db(DB_NAME);
+  await db.collection('users').createIndex({ email: 1 }, { unique: true });
+  await db.collection('sessions').createIndex({ token: 1 }, { unique: true });
+  await db.collection('sessions').createIndex({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 30 });
+  await db.collection('otps').createIndex({ email: 1 }, { unique: true });
+  await db.collection('otps').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 60 });
+  return db;
 }
-function readDb() {
-  ensureDb();
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-  catch { return { users: {}, sessions: {}, otp: {} }; }
-}
-function writeDb(db) {
-  ensureDb();
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-}
+
 function normalizeEmail(email) { return String(email || '').trim().toLowerCase(); }
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   const hash = crypto.pbkdf2Sync(String(password), salt, 120000, 64, 'sha512').toString('hex');
@@ -59,176 +59,170 @@ function cleanSave(save, nick) {
   return safe;
 }
 
-function requireBrevoConfig() {
-  const required = ['BREVO_API_KEY', 'MAIL_FROM'];
-  const missing = required.filter((key) => !process.env[key]);
-  if (missing.length) throw new Error('Brevo API ayarları eksik: ' + missing.join(', '));
-  if (!String(process.env.BREVO_API_KEY).startsWith('xkeysib-')) {
-    throw new Error('BREVO_API_KEY yanlış tipte. API key xkeysib- ile başlamalı.');
-  }
-}
-
 async function sendOtpMail(to, otp) {
-  requireBrevoConfig();
+  const apiKey = process.env.BREVO_API_KEY;
+  const fromEmail = process.env.MAIL_FROM || process.env.MAIL_USER;
+  const fromName = process.env.MAIL_FROM_NAME || 'GiWorlds';
   const appName = process.env.MAIL_APP_NAME || 'GiWorlds';
-  const senderName = process.env.MAIL_FROM_NAME || appName;
-  const senderEmail = process.env.MAIL_FROM;
+  if (!apiKey) throw new Error('BREVO_API_KEY eksik.');
+  if (!fromEmail) throw new Error('MAIL_FROM eksik.');
 
   const response = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
-    headers: {
-      'accept': 'application/json',
-      'content-type': 'application/json',
-      'api-key': process.env.BREVO_API_KEY
-    },
+    headers: { accept: 'application/json', 'api-key': apiKey, 'content-type': 'application/json' },
     body: JSON.stringify({
-      sender: { name: senderName, email: senderEmail },
+      sender: { name: fromName, email: fromEmail },
       to: [{ email: to }],
-      subject: appName + ' tek kullanımlık giriş kodu',
-      textContent: `Merhaba,\n\n${appName} tek kullanımlık giriş kodunuz: ${otp}\n\nBu kod 5 dakika geçerlidir. Bu işlemi siz yapmadıysanız bu maili dikkate almayın.`,
-      htmlContent: `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#111827"><h2>${appName} Tek Kullanımlık Giriş</h2><p>Giriş kodunuz:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${otp}</p><p>Bu kod <b>5 dakika</b> geçerlidir.</p><p>Bu işlemi siz yapmadıysanız bu maili dikkate almayın.</p></div>`
+      subject: appName + ' şifre yenileme kodu',
+      textContent: `Merhaba,\n\n${appName} şifre yenileme kodunuz: ${otp}\n\nBu kod 5 dakika geçerlidir.`,
+      htmlContent: `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#111827"><h2>${appName} Şifre Yenileme</h2><p>Tek kullanımlık şifre yenileme kodunuz:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${otp}</p><p>Bu kod <b>5 dakika</b> geçerlidir.</p></div>`
     })
   });
-
-  const text = await response.text();
   if (!response.ok) {
-    throw new Error(`Brevo API hata ${response.status}: ${text}`);
+    const body = await response.text();
+    throw new Error(`Brevo API hata ${response.status}: ${body}`);
   }
-  return text;
 }
 
-function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  const db = readDb();
-  const email = db.sessions[token];
-  if (!token || !email || !db.users[email]) {
-    return res.status(401).json({ ok: false, error: 'Oturum bulunamadı. Tekrar giriş yap.' });
+async function auth(req, res, next) {
+  try {
+    const database = await connectDb();
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    if (!token) return res.status(401).json({ ok: false, error: 'Oturum bulunamadı. Tekrar giriş yap.' });
+
+    const session = await database.collection('sessions').findOne({ token });
+    if (!session) return res.status(401).json({ ok: false, error: 'Oturum bulunamadı. Tekrar giriş yap.' });
+
+    const user = await database.collection('users').findOne({ email: session.email });
+    if (!user) return res.status(401).json({ ok: false, error: 'Kullanıcı bulunamadı. Tekrar giriş yap.' });
+
+    req.db = database;
+    req.email = session.email;
+    req.user = user;
+    next();
+  } catch (err) {
+    console.error('Auth hata:', err.message);
+    res.status(500).json({ ok: false, error: 'Sunucu oturum kontrolü yapamadı.' });
   }
-  req.db = db; req.email = email; req.user = db.users[email]; req.token = token;
-  next();
 }
 
-app.get('/', (req, res) => res.json({ ok: true, name: 'GiWorlds Backend', message: 'Backend çalışıyor.' }));
-app.get('/api/health', (req, res) => res.json({
-  ok: true,
-  name: 'GiWorlds Backend',
-  brevoConfigured: Boolean(process.env.BREVO_API_KEY && process.env.MAIL_FROM),
-  otpLogin: true
-}));
-
-app.post('/api/register', (req, res) => {
-  const { nick, password, save } = req.body || {};
-  const email = normalizeEmail(req.body && req.body.email);
-  if (!nick || String(nick).trim().length < 2) return res.status(400).json({ ok: false, error: 'Nickname en az 2 karakter olmalı.' });
-  if (!email.includes('@')) return res.status(400).json({ ok: false, error: 'Geçerli mail adresi yaz.' });
-  if (!password || String(password).length < 6) return res.status(400).json({ ok: false, error: 'Şifre en az 6 karakter olmalı.' });
-  const db = readDb();
-  if (db.users[email]) return res.status(409).json({ ok: false, error: 'Bu mail adresiyle zaten kayıt var.' });
-  const pass = hashPassword(password);
-  db.users[email] = { email, nick: String(nick).trim(), pass, save: cleanSave(save, String(nick).trim()), createdAt: Date.now() };
-  const token = makeToken(); db.sessions[token] = email;
-  writeDb(db);
-  res.json({ ok: true, token, user: { email, nick: db.users[email].nick }, save: db.users[email].save });
+app.get('/', (req, res) => res.json({ ok: true, name: 'GiWorlds Backend', message: 'Backend çalışıyor. Veriler MongoDB üzerinde kalıcı saklanır.' }));
+app.get('/api/health', async (req, res) => {
+  try {
+    await connectDb();
+    res.json({
+      ok: true,
+      name: 'GiWorlds Backend',
+      storage: 'mongodb',
+      mongodbConfigured: Boolean(process.env.MONGODB_URI),
+      brevoConfigured: Boolean(process.env.BREVO_API_KEY && (process.env.MAIL_FROM || process.env.MAIL_USER))
+    });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-app.post('/api/login', (req, res) => {
-  const email = normalizeEmail(req.body && req.body.email);
-  const password = req.body && req.body.password;
-  const db = readDb();
-  const user = db.users[email];
-  if (!user || !verifyPassword(password, user.pass)) return res.status(401).json({ ok: false, error: 'Mail adresi veya şifre hatalı.' });
-  const token = makeToken(); db.sessions[token] = email;
-  writeDb(db);
-  res.json({ ok: true, token, user: { email, nick: user.nick }, save: user.save || null });
+app.post('/api/register', async (req, res) => {
+  try {
+    const database = await connectDb();
+    const { nick, password, save } = req.body || {};
+    const email = normalizeEmail(req.body && req.body.email);
+    if (!nick || String(nick).trim().length < 2) return res.status(400).json({ ok: false, error: 'Nickname en az 2 karakter olmalı.' });
+    if (!email.includes('@')) return res.status(400).json({ ok: false, error: 'Geçerli mail adresi yaz.' });
+    if (!password || String(password).length < 6) return res.status(400).json({ ok: false, error: 'Şifre en az 6 karakter olmalı.' });
+    if (await database.collection('users').findOne({ email })) return res.status(409).json({ ok: false, error: 'Bu mail adresiyle zaten kayıt var.' });
+
+    const cleanNick = String(nick).trim();
+    const user = { email, nick: cleanNick, pass: hashPassword(password), save: cleanSave(save, cleanNick), createdAt: Date.now(), updatedAt: Date.now() };
+    await database.collection('users').insertOne(user);
+    const token = makeToken();
+    await database.collection('sessions').insertOne({ token, email, createdAt: new Date() });
+    res.json({ ok: true, token, user: { email, nick: cleanNick }, save: user.save });
+  } catch (err) { console.error('Register hata:', err.message); res.status(500).json({ ok: false, error: 'Kayıt oluşturulamadı.' }); }
 });
 
-app.post('/api/save', auth, (req, res) => {
-  req.user.save = cleanSave(req.body && req.body.save, req.user.nick);
-  req.db.users[req.email] = req.user;
-  writeDb(req.db);
-  res.json({ ok: true, savedAt: req.user.save.updatedAt });
+app.post('/api/login', async (req, res) => {
+  try {
+    const database = await connectDb();
+    const email = normalizeEmail(req.body && req.body.email);
+    const password = req.body && req.body.password;
+    const user = await database.collection('users').findOne({ email });
+    if (!user || !verifyPassword(password, user.pass)) return res.status(401).json({ ok: false, error: 'Mail adresi veya şifre hatalı.' });
+    const token = makeToken();
+    await database.collection('sessions').insertOne({ token, email, createdAt: new Date() });
+    res.json({ ok: true, token, user: { email, nick: user.nick }, save: user.save || null });
+  } catch (err) { console.error('Login hata:', err.message); res.status(500).json({ ok: false, error: 'Giriş yapılamadı.' }); }
 });
 
-app.post('/api/load', auth, (req, res) => {
+app.post('/api/save', auth, async (req, res) => {
+  try {
+    const save = cleanSave(req.body && req.body.save, req.user.nick);
+    await req.db.collection('users').updateOne({ email: req.email }, { $set: { save, updatedAt: Date.now() } });
+    res.json({ ok: true, savedAt: save.updatedAt });
+  } catch (err) { console.error('Save hata:', err.message); res.status(500).json({ ok: false, error: 'Oyun kaydedilemedi.' }); }
+});
+
+app.post('/api/load', auth, async (req, res) => {
   res.json({ ok: true, user: { email: req.email, nick: req.user.nick }, save: req.user.save || null });
 });
 
-// 1) OTP kodu gönderir
 app.post('/api/forgot/request', async (req, res) => {
-  const email = normalizeEmail(req.body && req.body.email);
-  const db = readDb();
-  if (!db.users[email]) return res.status(404).json({ ok: false, error: 'Bu mail adresiyle kayıt bulunamadı.' });
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
   try {
+    const database = await connectDb();
+    const email = normalizeEmail(req.body && req.body.email);
+    if (!await database.collection('users').findOne({ email })) return res.status(404).json({ ok: false, error: 'Bu mail adresiyle kayıt bulunamadı.' });
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
     await sendOtpMail(email, otp);
-    db.otp[email] = { otp, expires: Date.now() + 5 * 60 * 1000, sentAt: Date.now(), used: false };
-    writeDb(db);
-    res.json({ ok: true, message: 'Tek kullanımlık giriş kodu mail adresine gönderildi. Kod 5 dakika geçerlidir.' });
+    await database.collection('otps').updateOne(
+      { email },
+      { $set: { email, otp, expiresAt: new Date(Date.now() + 5 * 60 * 1000), sentAt: new Date() } },
+      { upsert: true }
+    );
+    res.json({ ok: true, message: 'Tek kullanımlık kod mail adresine gönderildi.' });
   } catch (err) {
     console.error('GiWorlds OTP mail gönderilemedi:', err.message);
     res.status(500).json({ ok: false, error: 'Mail gönderilemedi. Brevo API ayarlarını kontrol et.' });
   }
 });
 
-function verifyOtpAndLogin(email, otp) {
-  const db = readDb();
-  const user = db.users[email];
-  const row = db.otp[email];
-  if (!user) return { status: 404, body: { ok: false, error: 'Hesap bulunamadı.' } };
-  if (!row || row.used || Date.now() > row.expires || row.otp !== String(otp || '').trim()) {
-    return { status: 400, body: { ok: false, error: 'Tek kullanımlık kod hatalı veya süresi dolmuş.' } };
-  }
-  row.used = true;
-  const token = makeToken();
-  db.sessions[token] = email;
-  delete db.otp[email];
-  writeDb(db);
-  return { status: 200, body: { ok: true, token, user: { email, nick: user.nick }, save: user.save || null } };
-}
+app.post('/api/forgot/reset', async (req, res) => {
+  try {
+    const database = await connectDb();
+    const email = normalizeEmail(req.body && req.body.email);
+    const { otp, newPassword } = req.body || {};
+    const user = await database.collection('users').findOne({ email });
+    if (!user) return res.status(404).json({ ok: false, error: 'Hesap bulunamadı.' });
 
-// 2) OTP kodunu doğrular ve kullanıcıyı oyuna giriş yaptırır
-app.post('/api/otp/login', (req, res) => {
-  const email = normalizeEmail(req.body && req.body.email);
-  const otp = req.body && (req.body.otp || req.body.code);
-  const result = verifyOtpAndLogin(email, otp);
-  res.status(result.status).json(result.body);
+    const row = await database.collection('otps').findOne({ email });
+    if (!row || Date.now() > new Date(row.expiresAt).getTime() || row.otp !== String(otp || '')) {
+      return res.status(400).json({ ok: false, error: 'Tek kullanımlık şifre hatalı veya süresi dolmuş.' });
+    }
+    if (!newPassword || String(newPassword).length < 6) return res.status(400).json({ ok: false, error: 'Yeni şifre en az 6 karakter olmalı.' });
+
+    await database.collection('users').updateOne({ email }, { $set: { pass: hashPassword(newPassword), updatedAt: Date.now() } });
+    await database.collection('otps').deleteOne({ email });
+    res.json({ ok: true });
+  } catch (err) { console.error('Reset hata:', err.message); res.status(500).json({ ok: false, error: 'Şifre yenilenemedi.' }); }
 });
 
-// Frontend eski endpoint kullanırsa da OTP ile giriş yapsın.
-app.post('/api/forgot/verify', (req, res) => {
-  const email = normalizeEmail(req.body && req.body.email);
-  const otp = req.body && (req.body.otp || req.body.code);
-  const result = verifyOtpAndLogin(email, otp);
-  res.status(result.status).json(result.body);
+app.post('/api/forgot/verify-login', async (req, res) => {
+  try {
+    const database = await connectDb();
+    const email = normalizeEmail(req.body && req.body.email);
+    const { otp } = req.body || {};
+    const user = await database.collection('users').findOne({ email });
+    if (!user) return res.status(404).json({ ok: false, error: 'Hesap bulunamadı.' });
+
+    const row = await database.collection('otps').findOne({ email });
+    if (!row || Date.now() > new Date(row.expiresAt).getTime() || row.otp !== String(otp || '')) {
+      return res.status(400).json({ ok: false, error: 'Tek kullanımlık şifre hatalı veya süresi dolmuş.' });
+    }
+    await database.collection('otps').deleteOne({ email });
+    const token = makeToken();
+    await database.collection('sessions').insertOne({ token, email, createdAt: new Date() });
+    res.json({ ok: true, token, user: { email, nick: user.nick }, save: user.save || null });
+  } catch (err) { console.error('OTP login hata:', err.message); res.status(500).json({ ok: false, error: 'OTP ile giriş yapılamadı.' }); }
 });
 
-// Eski şifre yenileme sistemi de kalsın: yeni şifre verilirse şifre değiştirir.
-app.post('/api/forgot/reset', (req, res) => {
-  const email = normalizeEmail(req.body && req.body.email);
-  const { otp, code, newPassword } = req.body || {};
-  const finalOtp = otp || code;
-  const db = readDb();
-  const row = db.otp[email];
-  if (!db.users[email]) return res.status(404).json({ ok: false, error: 'Hesap bulunamadı.' });
-  if (!row || row.used || Date.now() > row.expires || row.otp !== String(finalOtp || '').trim()) {
-    return res.status(400).json({ ok: false, error: 'Tek kullanımlık kod hatalı veya süresi dolmuş.' });
-  }
-  if (!newPassword || String(newPassword).length < 6) {
-    // Yeni şifre yoksa OTP ile direkt giriş yaptır.
-    const result = verifyOtpAndLogin(email, finalOtp);
-    return res.status(result.status).json(result.body);
-  }
-  db.users[email].pass = hashPassword(newPassword);
-  row.used = true;
-  delete db.otp[email];
-  const token = makeToken();
-  db.sessions[token] = email;
-  writeDb(db);
-  res.json({ ok: true, token, user: { email, nick: db.users[email].nick }, save: db.users[email].save || null });
-});
-
-app.listen(PORT, () => {
-  ensureDb();
-  console.log(`GiWorlds Backend çalışıyor: http://localhost:${PORT}`);
-});
+connectDb()
+  .then(() => app.listen(PORT, () => console.log(`GiWorlds Backend çalışıyor: http://localhost:${PORT} | MongoDB aktif`)))
+  .catch((err) => { console.error('MongoDB bağlantı hatası:', err.message); process.exit(1); });
