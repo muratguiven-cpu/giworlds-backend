@@ -141,6 +141,18 @@ async function auth(req, res, next) {
 }
 
 app.get('/', (req, res) => res.json({ ok: true, name: 'GiWorlds Backend', message: 'Backend çalışıyor. MongoDB kalıcı kayıt ve gerçek leaderboard aktif.' }));
+
+app.get('/api/time', (req, res) => {
+  const now = new Date();
+  res.json({
+    ok: true,
+    serverTime: now.toISOString(),
+    timestamp: now.getTime(),
+    timezone: 'Europe/Istanbul',
+    source: 'render-server'
+  });
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     const database = await getDb();
