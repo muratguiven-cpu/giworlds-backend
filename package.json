@@ -1,7 +1,7 @@
 {
   "name": "giworlds-backend",
-  "version": "1.0.30",
-  "description": "GiWorlds backend - MongoDB persistent save and real leaderboard",
+  "version": "1.0.31",
+  "description": "GiWorlds backend - MongoDB persistent save, real leaderboard and Render server time",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
