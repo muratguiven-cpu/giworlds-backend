@@ -86,7 +86,7 @@ function getSnapshot(user) {
   const wealth = safeNum(save.cash, 0) + safeNum(save.bank, 0) + safeNum(save.gold, 0) * safeNum(save.price, 6749) + getCompanyValueFromSave(save);
   const tax = safeNum(save.taxPaid, 0);
   const work = safeNum(save.workCount, 0);
-  return { nick, wealth, tax, work, updatedAt: safeNum(save.updatedAt || user.updatedAt || user.createdAt || 0, 0), countryCode: String(save.countryCode || 'GW'), countryName: String(save.countryName || 'GiWorld') };
+  return { nick, wealth, tax, work, updatedAt: safeNum(save.updatedAt || user.updatedAt || user.createdAt || 0, 0) };
 }
 function cleanSave(save, nick) {
   const safe = (save && typeof save === 'object') ? save : {};
